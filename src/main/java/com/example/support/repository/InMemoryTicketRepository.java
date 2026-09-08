@@ -5,6 +5,7 @@ import java.util.ArrayList;
 import java.util.Comparator;
 import java.util.List;
 import java.util.Map;
+import java.util.Objects;
 import java.util.Optional;
 import java.util.concurrent.ConcurrentHashMap;
 
@@ -15,11 +16,34 @@ import java.util.concurrent.ConcurrentHashMap;
 public class InMemoryTicketRepository implements TicketRepository {
 
     private final Map<String, Ticket> ticketsById = new ConcurrentHashMap<>();
+    private final Object batchLock = new Object();
 
     @Override
     public Ticket save(Ticket ticket) {
         ticketsById.put(ticket.getId(), ticket.copy());
         return ticket.copy();
+    }
+
+    /**
+     * Validates and copies the whole batch before publishing any of it, so a rejected
+     * batch writes nothing and two concurrent batches cannot interleave. Single-key
+     * {@link #save(Ticket)} calls are still not serialised against a batch.
+     */
+    @Override
+    public List<Ticket> saveAll(List<Ticket> tickets) {
+        Objects.requireNonNull(tickets, "tickets");
+        List<Ticket> toStore = new ArrayList<>(tickets.size());
+        for (Ticket ticket : tickets) {
+            toStore.add(Objects.requireNonNull(ticket, "tickets must not contain null").copy());
+        }
+        List<Ticket> saved = new ArrayList<>(toStore.size());
+        synchronized (batchLock) {
+            for (Ticket ticket : toStore) {
+                ticketsById.put(ticket.getId(), ticket);
+                saved.add(ticket.copy());
+            }
+        }
+        return saved;
     }
 
     @Override

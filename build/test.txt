@@ -1,0 +1,10 @@
+src/test/java/com/example/support/api/TicketControllerTest.java
+src/test/java/com/example/support/ApplicationTest.java
+src/test/java/com/example/support/dto/TicketFilterTest.java
+src/test/java/com/example/support/exception/TicketMergeExceptionTest.java
+src/test/java/com/example/support/model/TicketPriorityTest.java
+src/test/java/com/example/support/model/TicketStatusTest.java
+src/test/java/com/example/support/model/TicketTest.java
+src/test/java/com/example/support/repository/InMemoryTicketRepositoryTest.java
+src/test/java/com/example/support/service/TicketMergerTest.java
+src/test/java/com/example/support/service/TicketServiceTest.java

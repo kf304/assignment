@@ -46,14 +46,52 @@ public final class Application {
         printHeader("Move it to IN_PROGRESS");
         System.out.println(controller.changeStatus(newId, TicketStatus.IN_PROGRESS).body());
 
+        printHeader("Merge duplicate tickets");
+        String survivorId = controller.createTicket(new CreateTicketRequest(
+                "Dana Weiss",
+                "Printer not detected",
+                "The office printer stopped appearing in the device list after the last update.",
+                TicketPriority.MEDIUM)).body().getId();
+        String duplicateId = controller.createTicket(new CreateTicketRequest(
+                "Dana Weiss",
+                "Printer still missing from the device list",
+                "Reported this last week too: the printer is still not listed after the update.",
+                TicketPriority.HIGH)).body().getId();
+
+        ApiResponse<Ticket> merged = controller.mergeTickets(duplicateId, survivorId);
+        Ticket survivor = merged.body();
+        Ticket duplicate = controller.getTicket(duplicateId).body();
+        System.out.println(merged.statusCode() + " -> survivor " + survivor);
+        System.out.println("  priority raised to " + survivor.getPriority() + " by the merge");
+        System.out.println("  duplicate " + duplicate.getId() + " is " + duplicate.getStatus()
+                + ", MERGED into " + duplicate.getMergedIntoId());
+        System.out.println("  absorbed text:");
+        printIndented(mergeBlockOf(survivor));
+
+        printHeader("Work queue with merged duplicates hidden");
+        printTickets(controller.listTickets(TicketFilter.excludingMerged()).body());
+
         printHeader("Error handling examples");
         System.out.println("Unknown id      -> " + describe(controller.getTicket("TCK-9999")));
         System.out.println("Blank subject   -> " + describe(controller.createTicket(
                 new CreateTicketRequest("Nobody", "  ", "Missing subject"))));
         System.out.println("Bad transition  -> " + describe(controller.changeStatus(newId, TicketStatus.IN_PROGRESS)));
+        System.out.println("Self merge      -> " + describe(controller.mergeTickets(survivorId, survivorId)));
+        System.out.println("Merged already  -> " + describe(controller.mergeTickets(duplicateId, newId)));
+        System.out.println("Other customer  -> " + describe(controller.mergeTickets(newId, survivorId)));
 
         printHeader("Ticket count");
         System.out.println(service.countTickets() + " tickets in store");
+    }
+
+    /** The part of a merged description that came from the duplicate. */
+    private static String mergeBlockOf(Ticket ticket) {
+        int start = ticket.getDescription().indexOf("--- Merged from");
+        return start < 0 ? "" : ticket.getDescription().substring(start);
+    }
+
+    private static void printIndented(String text) {
+        text.lines().forEach(line -> System.out.println("    " + line));
     }
 
     private static String describe(ApiResponse<?> response) {

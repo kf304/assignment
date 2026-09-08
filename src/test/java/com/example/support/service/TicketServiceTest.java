@@ -11,6 +11,7 @@ import com.example.support.dto.CreateTicketRequest;
 import com.example.support.dto.TicketFilter;
 import com.example.support.dto.UpdateTicketRequest;
 import com.example.support.exception.InvalidStatusTransitionException;
+import com.example.support.exception.TicketMergeException;
 import com.example.support.exception.TicketNotFoundException;
 import com.example.support.exception.ValidationException;
 import com.example.support.model.Ticket;
@@ -27,6 +28,9 @@ import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Nested;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.CsvSource;
+import org.junit.jupiter.params.provider.EnumSource;
+import org.junit.jupiter.params.provider.EnumSource.Mode;
 import org.junit.jupiter.params.provider.ValueSource;
 
 class TicketServiceTest {
@@ -299,6 +303,390 @@ class TicketServiceTest {
         void nullFilterReturnsEverything() {
             assertEquals(service.listTickets().size(), service.listTickets(null).size());
             assertEquals(service.listTickets().size(), service.listTickets(TicketFilter.none()).size());
+        }
+
+        @Test
+        void includesMergedTicketsByDefault() {
+            mergeTwoOfTheSeededTickets();
+
+            assertEquals(SampleData.tickets().size(), service.listTickets().size());
+            assertEquals(SampleData.tickets().size(), service.listTickets(TicketFilter.none()).size());
+            assertEquals(SampleData.tickets().size(), service.listTickets(null).size());
+            assertEquals(SampleData.tickets().size(), service.countTickets());
+        }
+
+        @Test
+        void excludeMergedHidesTombstones() {
+            String sourceId = mergeTwoOfTheSeededTickets();
+
+            List<Ticket> tickets = service.listTickets(TicketFilter.excludingMerged());
+
+            assertEquals(SampleData.tickets().size() - 1, tickets.size());
+            assertTrue(tickets.stream().noneMatch(Ticket::isMerged));
+            assertTrue(tickets.stream().noneMatch(t -> t.getId().equals(sourceId)));
+        }
+
+        @Test
+        void excludeMergedCombinesWithTheOtherCriteria() {
+            mergeTwoOfTheSeededTickets();
+
+            List<Ticket> withMerged = service.listTickets(
+                    new TicketFilter(null, null, "Aisha Rahman", false));
+            List<Ticket> withoutMerged = service.listTickets(
+                    new TicketFilter(null, null, "Aisha Rahman", true));
+
+            assertEquals(2, withMerged.size());
+            assertEquals(1, withoutMerged.size());
+            assertFalse(withoutMerged.get(0).isMerged());
+        }
+
+        /** Merges Aisha Rahman's two seeded tickets and returns the id of the closed duplicate. */
+        private String mergeTwoOfTheSeededTickets() {
+            List<Ticket> aishas = service.listTickets(TicketFilter.byCustomer("Aisha Rahman"));
+            String sourceId = aishas.get(0).getId();
+            String targetId = aishas.get(1).getId();
+            service.mergeTickets(sourceId, targetId);
+            return sourceId;
+        }
+    }
+
+    @Nested
+    class Merging {
+
+        @Test
+        @DisplayName("merges a duplicate into the surviving ticket and returns the target")
+        void mergesDuplicateIntoTargetAndReturnsTarget() {
+            String targetId = createTarget();
+            service.changeStatus(targetId, TicketStatus.IN_PROGRESS);
+            String sourceId = createDuplicate();
+            clock.advance(Duration.ofHours(1));
+
+            Ticket merged = service.mergeTickets(sourceId, targetId);
+
+            assertEquals(targetId, merged.getId());
+            assertEquals("Priya Nair", merged.getCustomerName());
+            assertEquals("Export to CSV times out for large reports", merged.getSubject());
+            assertEquals(TicketStatus.IN_PROGRESS, merged.getStatus());
+            assertEquals(TicketPriority.URGENT, merged.getPriority());
+            assertEquals(START_TIME, merged.getCreatedAt());
+            assertEquals(START_TIME.plus(Duration.ofHours(1)), merged.getUpdatedAt());
+            assertFalse(merged.isMerged());
+        }
+
+        @Test
+        void closesSourceAndRecordsMergeTarget() {
+            String targetId = createTarget();
+            String sourceId = createDuplicate();
+            clock.advance(Duration.ofHours(1));
+
+            service.mergeTickets(sourceId, targetId);
+
+            Ticket source = service.getTicket(sourceId);
+            assertEquals(TicketStatus.CLOSED, source.getStatus());
+            assertEquals(targetId, source.getMergedIntoId());
+            assertEquals(START_TIME.plus(Duration.ofHours(1)), source.getMergedAt());
+            assertEquals(START_TIME.plus(Duration.ofHours(1)), source.getUpdatedAt());
+            assertEquals(TicketPriority.HIGH, source.getPriority());
+        }
+
+        @Test
+        void sourceRemainsRetrievableAndNothingIsDeleted() {
+            String targetId = createTarget();
+            String sourceId = createDuplicate();
+
+            service.mergeTickets(sourceId, targetId);
+
+            assertEquals(sourceId, service.getTicket(sourceId).getId());
+            assertEquals(2, service.countTickets());
+        }
+
+        @ParameterizedTest
+        @CsvSource({
+                "LOW, LOW, LOW", "LOW, MEDIUM, MEDIUM", "LOW, HIGH, HIGH", "LOW, URGENT, URGENT",
+                "MEDIUM, LOW, MEDIUM", "MEDIUM, MEDIUM, MEDIUM", "MEDIUM, HIGH, HIGH", "MEDIUM, URGENT, URGENT",
+                "HIGH, LOW, HIGH", "HIGH, MEDIUM, HIGH", "HIGH, HIGH, HIGH", "HIGH, URGENT, URGENT",
+                "URGENT, LOW, URGENT", "URGENT, MEDIUM, URGENT", "URGENT, HIGH, URGENT", "URGENT, URGENT, URGENT"
+        })
+        void raisesTargetPriorityToTheHigherOfTheTwoAndNeverLowersIt(TicketPriority targetPriority,
+                                                                     TicketPriority sourcePriority,
+                                                                     TicketPriority expected) {
+            String targetId = createTarget(targetPriority);
+            String sourceId = createDuplicate(sourcePriority);
+
+            assertEquals(expected, service.mergeTickets(sourceId, targetId).getPriority());
+        }
+
+        @Test
+        void appendsSourceSubjectAndDescriptionToTarget() {
+            String targetId = createTarget();
+            String sourceId = createDuplicate();
+            String original = service.getTicket(targetId).getDescription();
+            clock.advance(Duration.ofHours(1));
+
+            String description = service.mergeTickets(sourceId, targetId).getDescription();
+
+            assertTrue(description.startsWith(original), description);
+            assertTrue(description.contains("--- Merged from " + sourceId
+                    + " (Priya Nair, 2026-09-01T10:00:00Z) ---"), description);
+            assertTrue(description.contains("Export to CSV still times out"), description);
+            assertTrue(description.contains("Retried this morning on the 80k-row report"), description);
+        }
+
+        @Test
+        void annotatesTheSourceWithItsMergeTarget() {
+            String targetId = createTarget();
+            String sourceId = createDuplicate();
+
+            service.mergeTickets(sourceId, targetId);
+
+            assertTrue(service.getTicket(sourceId).getDescription()
+                    .contains("--- Merged into " + targetId + " on 2026-09-01T09:00:00Z ---"));
+        }
+
+        @EnumSource(value = TicketStatus.class, names = "CLOSED", mode = Mode.EXCLUDE)
+        @ParameterizedTest
+        void leavesTargetStatusCustomerAndSubjectUnchanged(TicketStatus targetStatus) {
+            String targetId = createTarget();
+            if (targetStatus != TicketStatus.OPEN) {
+                service.changeStatus(targetId, targetStatus);
+            }
+            String sourceId = createDuplicate();
+
+            Ticket merged = service.mergeTickets(sourceId, targetId);
+
+            assertEquals(targetStatus, merged.getStatus());
+            assertEquals("Priya Nair", merged.getCustomerName());
+            assertEquals("Export to CSV times out for large reports", merged.getSubject());
+        }
+
+        @EnumSource(value = TicketStatus.class, names = "CLOSED", mode = Mode.EXCLUDE)
+        @ParameterizedTest
+        void mergesSourceInEveryNonClosedStatus(TicketStatus sourceStatus) {
+            String targetId = createTarget();
+            String sourceId = createDuplicate();
+            if (sourceStatus != TicketStatus.OPEN) {
+                service.changeStatus(sourceId, sourceStatus);
+            }
+
+            service.mergeTickets(sourceId, targetId);
+
+            assertEquals(TicketStatus.CLOSED, service.getTicket(sourceId).getStatus());
+        }
+
+        @Test
+        @DisplayName("merges an already closed source without an illegal transition")
+        void mergesAlreadyClosedSourceWithoutStatusTransitionError() {
+            String targetId = createTarget();
+            String sourceId = createDuplicate();
+            service.changeStatus(sourceId, TicketStatus.CLOSED);
+
+            Ticket merged = service.mergeTickets(sourceId, targetId);
+
+            assertEquals(targetId, merged.getId());
+            assertEquals(TicketStatus.CLOSED, service.getTicket(sourceId).getStatus());
+            assertEquals(targetId, service.getTicket(sourceId).getMergedIntoId());
+        }
+
+        @Test
+        void rejectsSelfMerge() {
+            String targetId = createTarget();
+
+            TicketMergeException error = assertThrows(TicketMergeException.class,
+                    () -> service.mergeTickets(targetId, targetId));
+            assertTrue(error.getMessage().contains(targetId), error.getMessage());
+            assertTrue(error.getMessage().contains("itself"), error.getMessage());
+        }
+
+        @Test
+        @DisplayName("reports a self-merge before checking that the ticket exists")
+        void rejectsSelfMergeOfUnknownIdBeforeLookup() {
+            assertThrows(TicketMergeException.class, () -> service.mergeTickets("TCK-9999", "TCK-9999"));
+        }
+
+        @Test
+        void rejectsSelfMergeAfterTrimmingIds() {
+            String targetId = createTarget();
+
+            assertThrows(TicketMergeException.class,
+                    () -> service.mergeTickets("  " + targetId + "  ", targetId));
+        }
+
+        @ParameterizedTest
+        @ValueSource(strings = {"", "   "})
+        void rejectsBlankIds(String blank) {
+            String targetId = createTarget();
+
+            assertThrows(ValidationException.class, () -> service.mergeTickets(blank, targetId));
+            assertThrows(ValidationException.class, () -> service.mergeTickets(targetId, blank));
+        }
+
+        @Test
+        void rejectsNullIds() {
+            String targetId = createTarget();
+
+            assertThrows(ValidationException.class, () -> service.mergeTickets(null, targetId));
+            assertThrows(ValidationException.class, () -> service.mergeTickets(targetId, null));
+        }
+
+        @Test
+        void throwsNotFoundForUnknownSourceOrTarget() {
+            String targetId = createTarget();
+            String sourceId = createDuplicate();
+
+            assertThrows(TicketNotFoundException.class, () -> service.mergeTickets("TCK-9999", targetId));
+            assertThrows(TicketNotFoundException.class, () -> service.mergeTickets(sourceId, "TCK-9999"));
+        }
+
+        @Test
+        void reportsTheSourceWhenBothIdsAreUnknown() {
+            TicketNotFoundException error = assertThrows(TicketNotFoundException.class,
+                    () -> service.mergeTickets("TCK-8888", "TCK-9999"));
+
+            assertTrue(error.getMessage().contains("TCK-8888"), error.getMessage());
+        }
+
+        @Test
+        void rejectsMergingAnAlreadyMergedSource() {
+            String targetId = createTarget();
+            String sourceId = createDuplicate();
+            service.mergeTickets(sourceId, targetId);
+            String otherTargetId = createTarget();
+
+            TicketMergeException error = assertThrows(TicketMergeException.class,
+                    () -> service.mergeTickets(sourceId, otherTargetId));
+            assertTrue(error.getMessage().contains(sourceId), error.getMessage());
+            assertTrue(error.getMessage().contains(targetId), error.getMessage());
+        }
+
+        @Test
+        void rejectsMergingIntoAnAlreadyMergedTarget() {
+            String survivorId = createTarget();
+            String middleId = createDuplicate();
+            service.mergeTickets(middleId, survivorId);
+            String newDuplicateId = createDuplicate();
+
+            TicketMergeException error = assertThrows(TicketMergeException.class,
+                    () -> service.mergeTickets(newDuplicateId, middleId));
+            assertTrue(error.getMessage().contains(middleId), error.getMessage());
+            assertTrue(error.getMessage().contains(survivorId), error.getMessage());
+        }
+
+        @Test
+        void rejectsMergingIntoAClosedTarget() {
+            String targetId = createTarget();
+            service.changeStatus(targetId, TicketStatus.CLOSED);
+            String sourceId = createDuplicate();
+
+            TicketMergeException error = assertThrows(TicketMergeException.class,
+                    () -> service.mergeTickets(sourceId, targetId));
+            assertTrue(error.getMessage().contains(targetId), error.getMessage());
+        }
+
+        @Test
+        void rejectsMergingTicketsOfDifferentCustomers() {
+            String targetId = createTarget();
+            String sourceId = service.createTicket(new CreateTicketRequest(
+                    "Marco Silva",
+                    "Export to CSV still times out",
+                    "Our export of the monthly report also times out.",
+                    TicketPriority.HIGH)).getId();
+
+            TicketMergeException error = assertThrows(TicketMergeException.class,
+                    () -> service.mergeTickets(sourceId, targetId));
+            assertTrue(error.getMessage().contains("Marco Silva"), error.getMessage());
+            assertTrue(error.getMessage().contains("Priya Nair"), error.getMessage());
+        }
+
+        @Test
+        void truncatesTheAppendedBlockWhenTheCombinedDescriptionExceedsTheLimit() {
+            String longDescription = "x".repeat(4900);
+            String targetId = service.createTicket(new CreateTicketRequest(
+                    "Priya Nair", "Export to CSV times out for large reports",
+                    longDescription, TicketPriority.URGENT)).getId();
+            String sourceId = service.createTicket(new CreateTicketRequest(
+                    "Priya Nair", "Export to CSV still times out",
+                    "y".repeat(400), TicketPriority.HIGH)).getId();
+
+            String description = service.mergeTickets(sourceId, targetId).getDescription();
+
+            assertEquals(TicketValidator.MAX_DESCRIPTION_LENGTH, description.length());
+            assertTrue(description.startsWith(longDescription));
+            assertTrue(description.endsWith("… [truncated]"));
+        }
+
+        @Test
+        void leavesBothTicketsUntouchedWhenValidationFails() {
+            String targetId = createTarget();
+            service.changeStatus(targetId, TicketStatus.CLOSED);
+            String sourceId = createDuplicate();
+            Ticket targetBefore = service.getTicket(targetId);
+            Ticket sourceBefore = service.getTicket(sourceId);
+
+            assertThrows(TicketMergeException.class, () -> service.mergeTickets(sourceId, targetId));
+
+            assertTicketUnchanged(targetBefore, service.getTicket(targetId));
+            assertTicketUnchanged(sourceBefore, service.getTicket(sourceId));
+        }
+
+        @Test
+        void leavesTheSourceUntouchedWhenTheTargetDoesNotExist() {
+            String sourceId = createDuplicate();
+            Ticket before = service.getTicket(sourceId);
+
+            assertThrows(TicketNotFoundException.class, () -> service.mergeTickets(sourceId, "TCK-9999"));
+
+            assertTicketUnchanged(before, service.getTicket(sourceId));
+        }
+
+        @Test
+        void mergeIsNotCommutative() {
+            String lowId = service.createTicket(new CreateTicketRequest(
+                    "Marco Silva", "Add dark mode", "Please add a dark theme.", TicketPriority.LOW)).getId();
+            String mediumId = service.createTicket(new CreateTicketRequest(
+                    "Marco Silva", "Dark mode request", "The dashboard is hard to read at night.",
+                    TicketPriority.MEDIUM)).getId();
+
+            Ticket merged = service.mergeTickets(lowId, mediumId);
+
+            assertEquals(mediumId, merged.getId());
+            assertEquals(TicketPriority.MEDIUM, merged.getPriority());
+            assertTrue(service.getTicket(lowId).isMerged());
+            assertFalse(service.getTicket(mediumId).isMerged());
+        }
+
+        private String createTarget() {
+            return createTarget(TicketPriority.URGENT);
+        }
+
+        private String createTarget(TicketPriority priority) {
+            return service.createTicket(new CreateTicketRequest(
+                    "Priya Nair",
+                    "Export to CSV times out for large reports",
+                    "Exporting the monthly usage report (about 80k rows) fails after roughly 60 seconds.",
+                    priority)).getId();
+        }
+
+        private String createDuplicate() {
+            return createDuplicate(TicketPriority.HIGH);
+        }
+
+        private String createDuplicate(TicketPriority priority) {
+            return service.createTicket(new CreateTicketRequest(
+                    "Priya Nair",
+                    "Export to CSV still times out",
+                    "Retried this morning on the 80k-row report, same gateway timeout at ~60s.",
+                    priority)).getId();
+        }
+
+        private void assertTicketUnchanged(Ticket before, Ticket after) {
+            assertEquals(before.getStatus(), after.getStatus());
+            assertEquals(before.getPriority(), after.getPriority());
+            assertEquals(before.getDescription(), after.getDescription());
+            assertEquals(before.getSubject(), after.getSubject());
+            assertEquals(before.getCustomerName(), after.getCustomerName());
+            assertEquals(before.getUpdatedAt(), after.getUpdatedAt());
+            assertEquals(before.getMergedIntoId(), after.getMergedIntoId());
+            assertEquals(before.getMergedAt(), after.getMergedAt());
         }
     }
 

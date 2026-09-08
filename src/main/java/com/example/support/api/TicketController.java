@@ -4,6 +4,7 @@ import com.example.support.dto.CreateTicketRequest;
 import com.example.support.dto.TicketFilter;
 import com.example.support.dto.UpdateTicketRequest;
 import com.example.support.exception.InvalidStatusTransitionException;
+import com.example.support.exception.TicketMergeException;
 import com.example.support.exception.TicketNotFoundException;
 import com.example.support.exception.ValidationException;
 import com.example.support.model.Ticket;
@@ -70,6 +71,19 @@ public class TicketController {
             return ApiResponse.ok(ticketService.changePriority(ticketId, newPriority));
         } catch (TicketNotFoundException e) {
             return ApiResponse.notFound(e.getMessage());
+        } catch (ValidationException e) {
+            return ApiResponse.badRequest(e.getMessage());
+        }
+    }
+
+    /** Merges the duplicate {@code sourceId} into {@code targetId} and returns the target. */
+    public ApiResponse<Ticket> mergeTickets(String sourceId, String targetId) {
+        try {
+            return ApiResponse.ok(ticketService.mergeTickets(sourceId, targetId));
+        } catch (TicketNotFoundException e) {
+            return ApiResponse.notFound(e.getMessage());
+        } catch (TicketMergeException e) {
+            return ApiResponse.conflict(e.getMessage());
         } catch (ValidationException e) {
             return ApiResponse.badRequest(e.getMessage());
         }

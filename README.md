@@ -11,7 +11,9 @@ to read and easy to extend.
 - Update a ticket (partial update: only the provided fields change)
 - Change ticket status, guarded by lifecycle rules
 - Change ticket priority
-- List tickets, newest first, optionally filtered by status, priority or customer
+- List tickets, newest first, optionally filtered by status, priority, customer or by
+  excluding merged duplicates
+- Merge a duplicate ticket into the ticket Support keeps working on
 - Delete a ticket and count tickets
 
 ## Ticket model
@@ -26,6 +28,8 @@ to read and easy to extend.
 | `priority`     | `TicketPriority` | `LOW`, `MEDIUM`, `HIGH`, `URGENT`              |
 | `createdAt`    | `Instant`        | Immutable, set on creation                     |
 | `updatedAt`    | `Instant`        | Stamped on every change                        |
+| `mergedIntoId` | `String`         | Null unless the ticket was merged into another |
+| `mergedAt`     | `Instant`        | Null unless the ticket was merged              |
 
 ### Status lifecycle
 
@@ -39,6 +43,46 @@ CLOSED      -> OPEN                     (reopen only)
 Any other transition — including a transition to the current status — is rejected with
 `InvalidStatusTransitionException`, which the controller maps to HTTP-style `409`.
 
+## Merging duplicate tickets
+
+`mergeTickets(sourceId, targetId)` merges a duplicate (**source**) into the ticket Support keeps
+working on (**target**). Nothing is deleted: the source is closed and kept as a tombstone that
+points at the survivor, so the customer's original ticket number still resolves.
+
+| | Target (survivor) | Source (duplicate) |
+|---|---|---|
+| `id`, `createdAt`, `customerName`, `subject` | unchanged | unchanged |
+| `status`      | unchanged                                  | forced to `CLOSED` |
+| `priority`    | raised to the higher of the two            | unchanged |
+| `description` | original text plus the duplicate's subject and description | annotated with the merge target |
+| `updatedAt`   | stamped                                    | stamped |
+| `mergedIntoId` / `mergedAt` | stay null                    | set to the target and the merge time |
+
+The appended block looks like this, and only the appended part is truncated if the result would
+exceed the 5000-character description limit — the target's own text is never cut:
+
+```
+--- Merged from TCK-1007 (Dana Weiss, 2026-09-08T20:22:32Z) ---
+Printer still missing from the device list
+
+Reported this last week too: the printer is still not listed after the update.
+```
+
+A merge is rejected with `TicketMergeException` (HTTP-style `409`) when:
+
+- the two ids are the same — a ticket cannot be merged with itself
+- the source has already been merged (merges are permanent; there is no unmerge)
+- the target has already been merged — merge chains are not followed automatically
+- the target is `CLOSED`, matching the rule that closed tickets cannot be edited
+- the two tickets belong to different customers
+
+A merge is not a lifecycle transition, so it never produces `InvalidStatusTransitionException`, and
+a source that is already `CLOSED` can still be merged. Both tickets are written in a single
+`saveAll` call, so a rejected merge writes nothing.
+
+Merged tickets stay in listings and in `countTickets()` by default;
+`TicketFilter.excludingMerged()` hides them from a work queue.
+
 ## Project structure
 
 ```
@@ -51,21 +95,23 @@ src/main/java/com/example/support/
   dto/
     CreateTicketRequest.java    Input for creation
     UpdateTicketRequest.java    Partial update (null = unchanged)
-    TicketFilter.java           Optional list criteria
+    TicketFilter.java           Optional list criteria (incl. excludeMerged)
   exception/
     TicketNotFoundException.java
     ValidationException.java
     InvalidStatusTransitionException.java
+    TicketMergeException.java
   model/
     Ticket.java                 Domain object
     TicketStatus.java           Lifecycle + allowed transitions
     TicketPriority.java
   repository/
-    TicketRepository.java       Storage abstraction
+    TicketRepository.java       Storage abstraction (incl. saveAll for multi-ticket writes)
     InMemoryTicketRepository.java  Thread-safe in-memory implementation
   service/
     TicketService.java          Business logic and validation
     TicketValidator.java        Field validation rules
+    TicketMerger.java           Duplicate-merge rules
     TicketIdGenerator.java      Id abstraction
     SequentialTicketIdGenerator.java
 
@@ -81,6 +127,7 @@ Layering is one-directional: `api` → `service` → `repository` → `model`.
 | Missing / blank / oversized field | `ValidationException`              | `400`      |
 | Unknown ticket id               | `TicketNotFoundException`            | `404`      |
 | Illegal status transition       | `InvalidStatusTransitionException`   | `409`      |
+| Tickets cannot be merged        | `TicketMergeException`               | `409`      |
 | Success                         | returns the ticket                   | `200` / `201` / `204` |
 
 ## Requirements
@@ -134,7 +181,7 @@ macOS / Linux:
 ./mvnw test
 ```
 
-Runs the JUnit 5 suite (55 tests) covering the model, repository, service and controller layers.
+Runs the JUnit 5 suite (193 tests) covering the model, repository, service and controller layers.
 
 ## Run
 
@@ -152,5 +199,6 @@ Or without packaging (Windows: `.\mvnw.cmd`):
 
 If a global Maven install is present, `mvn` can be used in place of `./mvnw` everywhere above.
 
-The demo seeds the sample tickets, lists them, creates and updates a ticket, changes its status
-and shows the validation, not-found and illegal-transition responses.
+The demo seeds the sample tickets, lists them, creates and updates a ticket, changes its status,
+merges a duplicate pair and shows the validation, not-found, illegal-transition and merge-conflict
+responses.

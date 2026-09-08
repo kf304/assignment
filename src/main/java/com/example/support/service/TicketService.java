@@ -4,6 +4,7 @@ import com.example.support.dto.CreateTicketRequest;
 import com.example.support.dto.TicketFilter;
 import com.example.support.dto.UpdateTicketRequest;
 import com.example.support.exception.InvalidStatusTransitionException;
+import com.example.support.exception.TicketMergeException;
 import com.example.support.exception.TicketNotFoundException;
 import com.example.support.exception.ValidationException;
 import com.example.support.model.Ticket;
@@ -106,6 +107,37 @@ public class TicketService {
         return updateTicket(ticketId, new UpdateTicketRequest(null, null, null, newPriority));
     }
 
+    /**
+     * Merges the duplicate {@code sourceId} into the surviving {@code targetId}: the target
+     * absorbs the duplicate's text and the higher of the two priorities, and the source is
+     * closed and permanently marked as merged. Both tickets are written as one operation.
+     *
+     * <p>This deliberately bypasses {@link #updateTicket} and {@link #changeStatus}: a merge
+     * is not a lifecycle transition, an already closed source must stay mergeable and the
+     * target's status is not changed at all.
+     *
+     * @return the merged target
+     * @throws ValidationException     if either id is blank
+     * @throws TicketMergeException    if the tickets cannot be merged
+     * @throws TicketNotFoundException if either ticket does not exist
+     */
+    public Ticket mergeTickets(String sourceId, String targetId) {
+        String source = TicketValidator.requireTicketId(sourceId);
+        String target = TicketValidator.requireTicketId(targetId);
+        if (source.equals(target)) {
+            throw new TicketMergeException("Cannot merge ticket " + source + " into itself");
+        }
+        Ticket sourceTicket = getTicket(source);
+        Ticket targetTicket = getTicket(target);
+        TicketMerger.requireMergeable(sourceTicket, targetTicket);
+
+        Instant now = clock.instant();
+        // The target absorbs the source's text first, before the source is annotated.
+        Ticket mergedTarget = TicketMerger.mergeInto(targetTicket, sourceTicket, now);
+        Ticket tombstone = TicketMerger.asTombstone(sourceTicket, target, now);
+        return repository.saveAll(List.of(mergedTarget, tombstone)).get(0);
+    }
+
     /** All tickets, newest first. */
     public List<Ticket> listTickets() {
         return repository.findAll();
@@ -121,6 +153,7 @@ public class TicketService {
                 .filter(ticket -> filter.priority() == null || ticket.getPriority() == filter.priority())
                 .filter(ticket -> filter.customerName() == null
                         || ticket.getCustomerName().equalsIgnoreCase(filter.customerName().trim()))
+                .filter(ticket -> !filter.excludeMerged() || !ticket.isMerged())
                 .toList();
     }
 
